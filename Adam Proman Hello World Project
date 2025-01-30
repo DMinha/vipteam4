@@ -1,0 +1,99 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from vesc_msgs.msg import VescStateStamped  # For feedback (optional)
+from vesc_msgs.msg import VescSetCommand
+
+class LidarProcessing(Node):
+    def __init__(self):
+        super().__init__('lidar_processing_node')
+
+        # Subscriber to '/scan' topic for LiDAR data
+        self.subscription = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.lidar_callback,
+            10
+        )
+
+        # Publisher to VESC speed command topic
+        self.vesc_publisher = self.create_publisher(VescSetCommand, '/commands/motor/speed', 10)
+
+        # Optional: Subscriber to VESC state for feedback (e.g., current speed)
+        self.vesc_state_sub = self.create_subscription(
+            VescStateStamped,
+            '/sensors/core',
+            self.vesc_state_callback,
+            10
+        )
+
+        # Define sector angles (in radians)
+        self.sector_angles = {
+            'left': (-1.5708, -0.7854),   # -90° to -45°
+            'front': (-0.7854, 0.7854),   # -45° to 45°
+            'right': (0.7854, 1.5708)     # 45° to 90°
+        }
+
+    def lidar_callback(self, msg):
+        self.get_logger().info('Received a LaserScan message')
+
+        # Extract LiDAR data
+        angle_min = msg.angle_min
+        angle_increment = msg.angle_increment
+        ranges = msg.ranges
+
+        # Calculate minimum distance in each sector
+        sector_distances = {}
+        for sector, (start_angle, end_angle) in self.sector_angles.items():
+            start_idx = int((start_angle - angle_min) / angle_increment)
+            end_idx = int((end_angle - angle_min) / angle_increment)
+            sector_ranges = ranges[start_idx:end_idx]
+            sector_distances[sector] = min(sector_ranges)
+
+        # Decision-making based on LiDAR readings
+        front_distance = sector_distances['front']
+        left_distance = sector_distances['left']
+        right_distance = sector_distances['right']
+
+        if front_distance < 0.3 and left_distance < 0.3:
+            self.get_logger().info("Obstacle detected: Turning Right!")
+            self.send_vesc_command('right')
+        elif front_distance < 0.3 and right_distance < 0.3:
+            self.get_logger().info("Obstacle detected: Turning Left!")
+            self.send_vesc_command('left')
+        elif front_distance < 0.3 and left_distance < 0.3 and right_distance < 0.3:
+            self.get_logger().info("Obstacle detected: Stopping!")
+            self.send_vesc_command('stop')
+        else:
+            self.get_logger().info("No obstacle: Continuing forward")
+            self.send_vesc_command('continue')
+
+    def send_vesc_command(self, direction):
+        msg = VescSetCommand()
+
+        # Define motor commands for each direction
+        if direction == 'right':
+            msg.data = -3000  # Negative value to turn right (adjust as needed)
+        elif direction == 'left':
+            msg.data = 3000   # Positive value to turn left
+        elif direction == 'stop':
+            msg.data = 0      # Stop motor
+        else:  # continue
+            msg.data = 5000   # Forward speed
+
+        self.vesc_publisher.publish(msg)
+        self.get_logger().info(f"Sent VESC command: {direction} ({msg.data} ERPM)")
+
+    def vesc_state_callback(self, msg):
+        # Optional: Log VESC state (e.g., current speed)
+        self.get_logger().info(f"VESC Speed: {msg.state.speed} ERPM")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LidarProcessing()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
