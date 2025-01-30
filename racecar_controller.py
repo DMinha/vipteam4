@@ -45,8 +45,7 @@ class RacecarController(Node):
         # Control logic
         cmd_vel = Twist()
         if math.isinf(min_distance):
-            self.get_logger().warn("No valid obstacle detected. Stopping.")
-            cmd_vel.linear.x = 0.0
+            cmd_vel.linear.x = self.max_speed  # Move at full speed
         elif min_distance <= self.stop_distance:
             cmd_vel.linear.x = 0.0  # Stop
         elif min_distance <= self.slow_down_distance:
