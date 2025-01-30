@@ -9,7 +9,7 @@ class RacecarController(Node):
         super().__init__('racecar_controller')
         
         # Declare parameters with defaults
-        self.declare_parameter('max_speed', 0.5)  # m/s
+        self.declare_parameter('max_speed', 0.2)  # m/s
         self.declare_parameter('slow_down_distance', 0.6096)  # 2ft in meters
         self.declare_parameter('stop_distance', 0.3048)  # 1ft in meters
         
