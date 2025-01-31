@@ -65,11 +65,11 @@ class LidarProcessing(Node):
         if front_distance < 0.3 and left_distance < 0.3:
             self.get_logger().info("Obstacle detected: Turning Right!")
             drive_msg.drive.speed = self.TURN_SPEED
-            drive_msg.drive.steering_angle = -self.MAX_STEERING_ANGLE  # Turn right
+            drive_msg.drive.steering_angle = self.MAX_STEERING_ANGLE  # Turn right
         elif front_distance < 0.3 and right_distance < 0.3:
             self.get_logger().info("Obstacle detected: Turning Left!")
             drive_msg.drive.speed = self.TURN_SPEED
-            drive_msg.drive.steering_angle = self.MAX_STEERING_ANGLE  # Turn left
+            drive_msg.drive.steering_angle = -self.MAX_STEERING_ANGLE  # Turn left
         elif front_distance < 0.3 and left_distance < 0.3 and right_distance < 0.3:
             self.get_logger().info("Obstacle detected: Stopping!")
             drive_msg.drive.speed = self.STOP_SPEED
