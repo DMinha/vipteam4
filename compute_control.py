@@ -274,7 +274,7 @@ class DisparityExtender:
         # self.logger.info(f"Checking max_value: {max_value}, Max_index: {max_index}, Angle: {steering_angle}, Disparity: {disparities}, Ranges: {len(proc_ranges)}")
         #REVERSE
         if (self.is_reversing and max_value < 1.7) or (not self.is_reversing and max_value < 1.3):
-            speed = 0
+            speed = -.4
             steering_angle = -steering_angle
             self.is_reversing = True
         # elif max_value < self.LINEAR_DISTANCE_THRESHOLD:
@@ -384,7 +384,7 @@ class ackermann_publisher(Node):
             self.lidar_callback,
             10
         )
-
+        
         self.stopsub = self.create_subscription(
             Bool,
             '/stopflag',  # Replace with your actual image topic
@@ -399,7 +399,7 @@ class ackermann_publisher(Node):
             self.stop_callback,
             10
         )
-
+        
         self.publisher = self.create_publisher(AckermannDriveStamped, '/ackermann_cmd', 10)
         # time.sleep(10)
 
@@ -414,12 +414,12 @@ class ackermann_publisher(Node):
         """Detects a cardboard box using LiDAR data"""
 
 	# Define thresholds for box detection (adjust as needed)
-        min_distance = 0.3   # Ignore very close objects
-        max_distance = .8   # Only consider objects within this range
-        min_width = 0.2      # Minimum width of a box (in meters)
-        max_width = 1.0      # Maximum width of a box (in meters)
-        max_height_variation = 0.5
-        max_cluster_size = 30
+        min_distance = 0.2   # Ignore very close objects
+        max_distance = 1.2   # Only consider objects within this range
+        min_width = 0.1      # Minimum width of a box (in meters)
+        max_width = 1.5      # Maximum width of a box (in meters)
+        max_height_variation = 0.4
+        max_cluster_size = 20
         
 
 	# Convert LiDAR data to Cartesian coordinates
@@ -438,7 +438,7 @@ class ackermann_publisher(Node):
         points = np.array(points)
 
         # Apply DBSCAN clustering to identify objects
-        clustering = DBSCAN(eps=0.1, min_samples=5).fit(points)
+        clustering = DBSCAN(eps=0.15, min_samples=5).fit(points)
         labels = clustering.labels_
 
         unique_clusters = set(labels) - {-1}  # Remove noise (-1 is noise)
@@ -469,19 +469,19 @@ class ackermann_publisher(Node):
         
         box_detected, box_angle, box_distance = self.detect_box(msg.ranges, msg.angle_min, msg.angle_increment)
         if box_detected:
-            self.get_logger().info(f"✅ Box Detected: {box_detected}")
+            self.get_logger().info(f"✅ Box Detected: {box_detected}, Box Distance: {box_distance}")
             # Safe distance to be from the box
-            SAFE_DISTANCE = 0.5
+            SAFE_DISTANCE = 0.7
             if box_distance > SAFE_DISTANCE: 
-            	steering_angle = box_angle #steer to the box
-            	speed = 0.5 #slow down to follow box
+                steering_angle = np.sign(box_angle) * abs(box_angle)  # Ensure the sign is correct
+                speed = 0.5 #slow down to follow box
             else: 
             	#stop at the box
             	self.get_logger().info("🛑 Box is too close! Stopping car.")
             	steering_angle = 0.0
             	speed = 0.0
         else:
-            self.get_logger().info(f"Box Detected: {box_detected}")
+            self.get_logger().info(f"No box, using disparity!")
             try:
             	speed, steering_angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(msg)
             except Exception as e:
