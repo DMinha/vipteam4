@@ -1,0 +1,6 @@
+image: map_house.pgm
+resolution: 0.05        # meters/pixel — change this if you know the real value
+origin: [0.0, 0.0, 0.0] # [x, y, theta] of the bottom-left corner of the map
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196
