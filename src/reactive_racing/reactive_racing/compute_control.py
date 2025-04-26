@@ -1,540 +1,316 @@
+'''
+#!/usr/bin/env python3
+
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
-import copy
-from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
-import math
-from std_msgs.msg import Bool
-import numpy as np
-import time
+from sensor_msgs.msg import Joy
+from ackermann_msgs.msg import AckermannDriveStamped
 
-PI = math.pi
-MIN_ANGLE = math.pi/2
-MAX_ANGLE = -math.pi/2
-DISPARITY_THRESHOLD = 0.2
-C_W = 0.3
-C_L = 0.5
-
-class DisparityExtender:
-    CAR_WIDTH = 0.268
-    # the min difference between adjacent LiDAR points for us to call them disparate
-    DIFFERENCE_THRESHOLD = 0.05
-    
-    # TIME TRIAL
-    MAX_SPEED = 3.7
-
-    # STOP SIGN
-    # MAX_SPEED = 0.5
-    
-    LINEAR_DISTANCE_THRESHOLD = 5.0
-    ANGLE_CHANGE_THRESHOLD = 0.0
-    ANGLE_CHANGE_SPEED = 0.5
-    MAX_ANGLE = 0.8
-    SLOW_SPEED = 1.0
-    MAX_DISTANCE_C = 0.95
-    WHEELBASE_WIDTH=0.328#0.328
-    coefficient_of_friction=0.62
-    gravity=9.81998
-    REVERSAL_THRESHHOLD = 0.85
-    SLOWDOWN_SLOPE = 0.93
-
-    prev_angle = 0.0
-    prev_index = None
-    is_reversing = False
-
-    PREV_STOP = False
-    STOP_CONTROLLER = False
-    STOP_TIME = -1
-
-    def __init__(self, logger):
-        self.logger = logger
-    
-
-    def preprocess_lidar(self, ranges):
-        """ Any preprocessing of the LiDAR data can be done in this function.
-            Possible Improvements: smoothing of outliers in the data and placing
-            a cap on the maximum distance a point can be.
-        """
-        # remove quadrant of LiDAR directly behind us
-        eighth = int(len(ranges) / 6)
-        return np.array(ranges[eighth:-eighth])
-
-    def get_differences(self, ranges):
-        """ Gets the absolute difference between adjacent elements in
-            in the LiDAR data and returns them in an array.
-            Possible Improvements: replace for loop with numpy array arithmetic
-        """
-        differences = [0.]  # set first element to 0
-        for i in range(1, len(ranges)):
-            differences.append(abs(ranges[i] - ranges[i - 1]))
-        return differences
-
-    def get_disparities(self, differences, threshold):
-        """ Gets the indexes of the LiDAR points that were greatly
-            different to their adjacent point.
-            Possible Improvements: replace for loop with numpy array arithmetic
-        """
-        disparities = []
-        for index, difference in enumerate(differences):
-            if difference > threshold:
-                disparities.append(index)
-        return disparities
-
-    def get_num_points_to_cover(self, dist, width):
-        """ Returns the number of LiDAR points that correspond to a width at
-            a given distance.
-            We calculate the angle that would span the width at this distance,
-            then convert this angle to the number of LiDAR points that
-            span this angle.
-            Current math for angle:
-                sin(angle/2) = (w/2)/d) = w/2d
-                angle/2 = sininv(w/2d)
-                angle = 2sininv(w/2d)
-                where w is the width to cover, and d is the distance to the close
-                point.
-            Possible Improvements: use a different method to calculate the angle
-        """
-        # angle = 2 * np.arcsin(width / (2 * dist))
-        # num_points = int(np.ceil(angle / self.radians_per_point))
-        # return num_points
-        # angle = 2 * np.arcsin(width / (2 * dist))
-        # num_points = int(np.ceil(angle / self.radians_per_point))
-        # return num_points
-        angle_step=(0.25)*(math.pi/180)
-        arc_length=angle_step*dist
-        return int(math.ceil(self.CAR_WIDTH / arc_length))
-
-    def cover_points(self, num_points, start_idx, cover_right, ranges):
-        """ 'covers' a number of LiDAR points with the distance of a closer
-            LiDAR point, to avoid us crashing with the corner of the car.
-            num_points: the number of points to cover
-            start_idx: the LiDAR point we are using as our distance
-            cover_right: True/False, decides whether we cover the points to
-                         right or to the left of start_idx
-            ranges: the LiDAR points
-
-            Possible improvements: reduce this function to fewer lines
-        """
-        new_dist = ranges[start_idx]
-        if cover_right:
-            for i in range(num_points):
-                next_idx = start_idx + 1 + i
-                if next_idx >= len(ranges): break
-                if ranges[next_idx] > new_dist:
-                    ranges[next_idx] = new_dist
-        else:
-            for i in range(num_points):
-                next_idx = start_idx - 1 - i
-                if next_idx < 0: break
-                if ranges[next_idx] > new_dist:
-                    ranges[next_idx] = new_dist
-        return ranges
-
-    def extend_disparities(self, disparities, ranges, car_width):
-        """ For each pair of points we have decided have a large difference
-            between them, we choose which side to cover (the opposite to
-            the closer point), call the cover function, and return the
-            resultant covered array.
-            Possible Improvements: reduce to fewer lines
-        """
-        width_to_cover = (car_width / 2)
-        for index in disparities:
-            first_idx = index - 1
-            points = ranges[first_idx:first_idx + 2]
-            close_idx = first_idx + np.argmin(points)
-            far_idx = first_idx + np.argmax(points)
-            close_dist = ranges[close_idx]
-            num_points_to_cover = self.get_num_points_to_cover(close_dist,
-                                                               width_to_cover)
-            cover_right = close_idx < far_idx
-            ranges = self.cover_points(num_points_to_cover, close_idx,
-                                       cover_right, ranges)
-        return ranges
-
-    def get_steering_angle(self, range_index, angle_increment, range_len):
-        """ Calculate the angle that corresponds to a given LiDAR point and
-            process it into a steering angle.
-            Possible improvements: smoothing of aggressive steering angles
-        """
-        angle = -1.57 + (range_index * angle_increment)
-
-        if angle < -1.57:
-            angle = -1.57
-        elif angle > 1.57:
-            angle = 1.57
-        return angle
-
-        # degrees = range_index / 3
-        # angle = math.radians(degrees)
-        
-
-        # if angle < -1.57:
-        #     return -1.57
-        # elif angle > 1.57:
-        #     return 1.57
-        # return angle
-
-        # lidar_angle = (range_index - (range_len / 2)) * self.radians_per_point
-        # steering_angle = np.clip(lidar_angle, np.radians(-90), np.radians(90))
-        # return steering_angle
-    
-    def calculate_min_turning_radius(self,angle,forward_distance):
-        # angle=abs(angle)
-        # if(angle<0.0872665):#if the angle is less than 5 degrees just go as fast possible
-        #     return self.MAX_SPEED
-        # else:
-        #     turning_radius=(self.WHEELBASE_WIDTH/math.sin(angle))
-        #     maximum_velocity=math.sqrt(self.coefficient_of_friction*self.gravity*turning_radius)
-        #     if(maximum_velocity<self.MAX_SPEED):
-        #         maximum_velocity=maximum_velocity*(maximum_velocity/self.MAX_SPEE;D)
-        #     else:
-        #         maximum_velocity=self.MAX_SPEED
-        # return maximum_velocity
-        angle = abs(angle)
-        if angle < 0.0872665:  # 5 degrees in radians
-            return self.MAX_SPEED
-        else:
-            turning_radius = (self.WHEELBASE_WIDTH / math.sin(angle))
-            maximum_velocity = math.sqrt(self.coefficient_of_friction * self.gravity * turning_radius)
-
-            # Calculate stopping distance
-            # Assuming deceleration = 0.5 * gravity (modify as per actual deceleration capabilities)
-            stopping_distance = (maximum_velocity ** 2) / (2 * 0.5 * self.gravity)
-            if stopping_distance > forward_distance:
-                # If stopping distance exceeds forward distance, reduce maximum velocity
-                # Calculate new safe velocity to stop within the forward distance
-                maximum_velocity = math.sqrt(2 * 0.5 * self.gravity * forward_distance)
-
-            if maximum_velocity < self.MAX_SPEED:
-                maximum_velocity = maximum_velocity * (maximum_velocity / self.MAX_SPEED)
-            else:
-                maximum_velocity = self.MAX_SPEED
-        
-        return maximum_velocity
-
-    def _process_lidar(self, lidar_data):
-        """ Run the disparity extender algorithm!
-            Possible improvements: varying the speed based on the
-            steering angle or the distance to the farthest point.
-        """
-        ranges = lidar_data.ranges
-        self.radians_per_point = (2 * np.pi) / len(ranges)
-        proc_ranges = self.preprocess_lidar(ranges)
-        differences = self.get_differences(proc_ranges)
-        disparities = self.get_disparities(differences, self.DIFFERENCE_THRESHOLD)
-        proc_ranges = self.extend_disparities(disparities, proc_ranges,
-                                              self.CAR_WIDTH)
-        # max_value=max(proc_ranges)
-
-        # if self.prev_index != None and proc_ranges[self.prev_index] > 2 and abs(curr_steering_angle - self.prev_angle) < 0.1:
-        #     steering_angle = self.prev_angle
-        #     max_value = proc_ranges[self.prev_index]
-        #     max_index = self.prev_index
-        # else:
-        max_value = max(proc_ranges)
-        max_index = np.argmax(proc_ranges)
-
-        # np_ranges = np.array(proc_ranges)
-        # greater_indices = np.where(np_ranges >= max_value)[0]
-
-        # if(len(greater_indices)==1):
-        #     max_index = greater_indices[0]
-        # else:
-        #     mid=int(len(greater_indices)/2)
-        #     max_index = greater_indices[mid]
-
-        np_ranges = np.array(proc_ranges)
-        # greater_indices = np_ranges >= self.MAX_DISTANCE_C_THRESHOLD
-        # greater_indices = np.where(np_ranges >= min(self.MAX_DISTANCE_C_THRESHOLD, max_value*self.MAX_DISTANCE_C))[0]
-        
-        greater_indices = np.where(np_ranges >= max_value*self.MAX_DISTANCE_C)[0]
-        differences = np.abs(greater_indices - 360)
-        max_index = greater_indices[np.argmin(differences)]
-        center_index = len(proc_ranges) // 2
-        greater_indices = np.where(np_ranges >= max_value * self.MAX_DISTANCE_C)[0]
-        #differences = np.abs(greater_indices - center_index)
-        #if len(differences) > 0:
-        #    max_index = greater_indices[np.argmin(differences)]
-        #else:
-        #    max_index = center_index
-
-        max_value = proc_ranges[max_index]
-        
-        # self.logger.info(f"greater indices: {greater_indices}, max index: {max_index}, max_value: {max_value}")
-
-        steering_angle = self.get_steering_angle(max_index, lidar_data.angle_increment, len(proc_ranges))
-        #steering_angle = self.get_steering_angle(max_index, lidar_data.angle_increment, lidar_data.angle_min)
-
-        d_theta = abs(steering_angle)
-
-        self.prev_angle = steering_angle
-        self.prev_index = max_index
-
-        # self.logger.info(f"Checking max_value: {max_value}, Max_index: {max_index}, Angle: {steering_angle}, Disparity: {disparities}, Ranges: {len(proc_ranges)}")
-        
-        if (self.is_reversing and max_value < 1.7) or (not self.is_reversing and max_value < 1.3):
-            speed = -0.75
-            steering_angle = -steering_angle
-            self.is_reversing = True
-        # elif max_value < self.LINEAR_DISTANCE_THRESHOLD:
-        #     speed = max(0.5, self.MAX_SPEED - 0.9 * self.MAX_SPEED * ((self.LINEAR_DISTANCE_THRESHOLD - max_value) / self.LINEAR_DISTANCE_THRESHOLD))
-        # elif d_theta > self.ANGLE_CHANGE_THRESHOLD:
-        #     speed = calculate_min_turning_radius(steering_angle, max_value)
-        else:
-            self.is_reversing = False
-            speed_d = max(
-                0.5, 
-                self.MAX_SPEED -  self.MAX_SPEED * (self.SLOWDOWN_SLOPE * (self.LINEAR_DISTANCE_THRESHOLD - max_value) / self.LINEAR_DISTANCE_THRESHOLD)
-            )
-            speed_a = self.calculate_min_turning_radius(steering_angle, max_value)
-            speed = min(speed_d, speed_a)
-            min_speed = 0.5
-
-            if max_value < 0.5:
-                min_speed = 0.45
-            elif max_value < 1.3:
-                min_speed = 0.9
-            elif max_value < 1.7:
-                min_speed = 1.0
-            elif max_value < 2.0:
-                min_speed = 1.4
-            elif max_value < 2.5:
-                min_speed = 1.3
-            elif max_value < 3:
-                min_speed = 1.7
-            else:
-                min_speed = 2.2
-            
-            min_speed = 1.05 * min_speed
-            # min_speed = min(1.5, (max_value / 3))
-            speed = max(0.5, min_speed, speed)
-            # speed = max(
-            #     0.6,
-            #     speed
-            # )
-
-        if speed > self.MAX_SPEED:
-            speed = self.MAX_SPEED
-        
-        # speed = max(0.5, self.MAX_SPEED - 1.2 * self.MAX_SPEED * (d_theta / self.MAX_ANGLE))
-        if not self.is_reversing:
-            if d_theta > ((1/10) * self.MAX_ANGLE):
-                speed = max(
-                    0.5,
-                    (1.45 * speed) - (speed * ((d_theta - (18 * np.pi / 180)) / self.MAX_ANGLE))
-                )   
-
-            # UNTESTED
-            if d_theta > (20 * np.pi / 180):
-                speed *= 1.1 + ((d_theta * 180 / np.pi) / 90)
-
-            # if abs(steering_angle) < (10 * np.pi / 180):
-            #     # % faster if less than X dg change in steer
-            #     speed *= 1.05
-
-            # UNTESTED SUBSTITUTE
-            # if steering_angle > ((1/10) * self.MAX_ANGLE):
-            #     cand_speed = (1.2 * speed) - (speed * (steering_angle / (2*self.MAX_ANGLE))) 
-
-            #     if cand_speed > self.MAX_SPEED:
-            #         cand_speed = 0.7 * self.MAX_SPEED
-
-            #     speed = max(
-            #         0.5,
-            #         cand_speed
-            #     )   
-
-
-        
-        self.logger.info(f"speed: {speed}, max_value: {max_value}, angle change (rads): {d_theta}, steering angle: {steering_angle}")
-
-        # if abs(steering_angle) > 20.0 / 180.0 * 3.14:
-        #     speed = 1.5
-        # elif abs(steering_angle) > 10.0 / 180.0 * 3.14:
-        #     speed = 2.0
-        # else:
-        #     speed = 2.3
-
-        # if max_value < 1.5:
-        #     speed = 0.0
-
-        return speed, steering_angle, max_value, max_index, differences, disparities, proc_ranges
-
-    def process_observation(self, lidar_data, ego_odom):
-        return self._process_lidar(lidar_data)
-
-
-class ackermann_publisher(Node):
-
-    LAST_LIDAR = None
-    READY_GO = False
-    COMPLETED_STOP = False
-    
-    FAST_MODE = True
-
-    STOP_COUNT = 0
-
+class JoystickAckermannTeleop(Node):
     def __init__(self):
-        super().__init__('team_1_publisher')
-        self.disparity = DisparityExtender(self.get_logger())
-        self.laser_subscription = self.create_subscription(
-            LaserScan,  # message type
-            'scan',
-            self.lidar_callback,
-            10
-        )
+        super().__init__('joystick_ackermann_teleop')
 
-        self.stopsub = self.create_subscription(
-            Bool,
-            '/stopflag',  # Replace with your actual image topic
-            self.stop_callback,
-            10
-        )
+        # Declare parameters for joystick-to-ackermann mapping.
+        # You can adjust these values as needed.
+        self.declare_parameter('axis_speed', 1)       # e.g., left stick vertical axis for speed
+        self.declare_parameter('axis_steering', 0)      # e.g., left stick horizontal axis for steering
+        self.declare_parameter('scale_speed', 1.0)      # Speed multiplier
+        self.declare_parameter('scale_steering', 0.5)   # Steering multiplier (radians)
+        self.declare_parameter('deadzone', 0.1)           # Threshold to ignore small inputs
+        self.declare_parameter('ackermann_topic', '/ackermann_cmd')
 
+        # Retrieve parameters.
+        self.axis_speed = self.get_parameter('axis_speed').value
+        self.axis_steering = self.get_parameter('axis_steering').value
+        self.scale_speed = self.get_parameter('scale_speed').value
+        self.scale_steering = self.get_parameter('scale_steering').value
+        self.deadzone = self.get_parameter('deadzone').value
+        self.ackermann_topic = self.get_parameter('ackermann_topic').value
 
-        self.stopready = self.create_subscription(
-            Bool,
-            '/stop_ack',  # Replace with your actual image topic
-            self.stop_callback,
-            10
-        )
+        # Publisher for Ackermann drive commands.
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_topic, 10)
+        # Subscriber for joystick messages.
+        self.joy_sub = self.create_subscription(Joy, 'joy', self.joy_callback, 10)
 
-        self.publisher = self.create_publisher(AckermannDriveStamped, '/ackermann_cmd', 10)
-        # time.sleep(10)
+        self.get_logger().info("Joystick Ackermann Teleop Node has started.")
 
-    def stop_callback(self, msg: Bool):
-        ready = msg.data
-        if ready:
-            self.READY_GO = ready
+    def joy_callback(self, msg: Joy):
+        # Log the raw joystick inputs.
+        self.get_logger().info(f"Joystick Input => Axes: {msg.axes}, Buttons: {msg.buttons}")
+
+        # Ensure the message has enough axes.
+        if len(msg.axes) > max(self.axis_speed, self.axis_steering):
+            # Retrieve and filter the joystick values.
+            speed_val = msg.axes[self.axis_speed]
+            steering_val = msg.axes[self.axis_steering]
+
+            # Apply deadzone filtering.
+            if abs(speed_val) < self.deadzone:
+                speed_val = 0.0
+            if abs(steering_val) < self.deadzone:
+                steering_val = 0.0
+
+            # Scale the inputs.
+            speed = self.scale_speed * speed_val
+            steering_angle = self.scale_steering * steering_val
+
+            # Create and populate the Ackermann command message.
+            ackermann_cmd = AckermannDriveStamped()
+            ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
+            ackermann_cmd.header.frame_id = "base_link"  # Change as needed
+            ackermann_cmd.drive.speed = speed
+            ackermann_cmd.drive.steering_angle = steering_angle
+
+            # Publish the Ackermann command.
+            self.drive_pub.publish(ackermann_cmd)
+            self.get_logger().info(f"Published Ackermann: speed={speed:.2f}, steering_angle={steering_angle:.2f}")
         else:
-            return
-
-    def lidar_callback(self, msg: LaserScan):
-        # speed, angle = self.reactive_controller.calc_speed_and_angle(msg)
-        # self.disparity.logger.info(f"{self.READY_GO}")
-        if not self.FAST_MODE:
-            self.LAST_LIDAR = msg
-            if (not self.disparity.STOP_CONTROLLER):
-                speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(msg)
-                stamped_msg = AckermannDriveStamped()
-                stamped_msg.drive = AckermannDrive()
-                stamped_msg.drive.steering_angle = angle
-                stamped_msg.drive.speed = speed
-
-                # if not self.READY_GO:
-                #     stamped_msg.drive.speed = 0.
-
-                self.publisher.publish(stamped_msg)
-            else:
-                return
-        
-        else:
-            speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(msg)
-            stamped_msg = AckermannDriveStamped()
-            stamped_msg.drive = AckermannDrive()
-            stamped_msg.drive.steering_angle = angle
-            stamped_msg.drive.speed = speed
-
-            # if not self.READY_GO:
-            #     stamped_msg.drive.speed = 0.
-
-            self.publisher.publish(stamped_msg)
-
-
-    def stop_callback(self, msg: Bool):
-        self.disparity.logger.info(f"flag: {msg.data}")
-
-        if not self.FAST_MODE:
-            now = time.time()
-            detected = msg.data
-
-            # if detected:
-            #     self.STOP_COUNT += 1
-
-            # if self.STOP_COUNT >= 4:
-            #     if self.disparity.STOP_TIME == -1:
-            #         # haven't stopped on a callback yet
-            #         self.disparity.logger.info("waiting !!")
-            #         self.disparity.STOP_TIME = time.time()
-
-            #     else:
-            #         # already stopped
-            #         if now - self.disparity.STOP_TIME >= 2.3:
-            #             self.disparity.logger.info("uno segundo !!")
-            #             self.disparity.STOP_TIME = -1
-            #             self.disparity.PREV_STOP = False
-            #             self.disparity.STOP_CONTROLLER = False
-            #             self.STOP_COUNT = 0
-
-
-            if detected and not self.disparity.PREV_STOP:
-                # first detection, alternative controller
-                self.disparity.PREV_STOP = True
-                self.disparity.STOP_CONTROLLER = True
-
-            elif not detected:
-                # no longer in viewing range but already detected; let's stop for 1 second
-                
-                if self.disparity.PREV_STOP and self.disparity.STOP_TIME == -1:
-                    # haven't stopped on a callback yet
-                    self.disparity.logger.info("waiting !!")
-                    self.disparity.STOP_TIME = time.time()
-                    # self.disparity.PREV_STOP = False
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.
-                    self.publisher.publish(stamped_msg)
-
-                elif self.disparity.PREV_STOP:
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.
-                    self.publisher.publish(stamped_msg)
-                    
-                    # already stopped
-                    if now - self.disparity.STOP_TIME >= 1.5:
-                        self.disparity.logger.info(f"{now - self.disparity.STOP_TIME} uno segundo !!")
-                        self.disparity.STOP_TIME = -1
-                        self.disparity.PREV_STOP = False
-                        self.disparity.STOP_CONTROLLER = False
-
-            if self.disparity.STOP_CONTROLLER and self.disparity.STOP_TIME == -1:
-                self.disparity.logger.info("stop controller")
-                if self.LAST_LIDAR:
-                    speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(self.LAST_LIDAR)
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = angle
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.5
-                else:
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.3
-
-                # if not self.READY_GO:
-                #     stamped_msg.drive.speed = 0.
-
-                self.publisher.publish(stamped_msg)
-
-
+            self.get_logger().warning("Received Joy message with insufficient axes.")
 
 def main(args=None):
     rclpy.init(args=args)
-    ackermann_publisher_i = ackermann_publisher()
-    rclpy.spin(ackermann_publisher_i)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    ackermann_publisher_i.destroy_node()
+    node = JoystickAckermannTeleop()
+    rclpy.spin(node)
+    node.destroy_node()
     rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+'''
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
+from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
+from ackermann_msgs.msg import AckermannDriveStamped
+from nav_msgs.msg import Path
+import numpy as np
+# import pickle # No longer needed
+import math
+import sys
+# from nav2_msgs.srv import ClearEntireCostmap # No longer needed
+import os
+
+# Define constants at the top
+LOOKAHEAD_DISTANCE = 1.2
+MAX_SPEED = 0.7
+MIN_SPEED = 0.5
+
+class PurePursuitNode(Node):
+    def __init__(self):
+        super().__init__('pure_pursuit_node')
+
+        # --- Parameters ---
+        self.declare_parameter('track_file_path', '/home/nvidia/Desktop/team3-vip-f24/build/reactive_racing/reactive_racing/optimized_raceline.csv') # <-- Uses CSV
+        self.declare_parameter('wheelbase', 0.33)
+        # Path Visualization Parameters
+        self.declare_parameter('visualize_path', True)
+        self.declare_parameter('visualize_path_topic', '/loaded_raceline_path')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('visualization_publish_period', 5.0)
+
+        # Get Parameter Values
+        track_file = self.get_parameter('track_file_path').get_parameter_value().string_value
+        self.wheelbase = self.get_parameter('wheelbase').get_parameter_value().double_value
+        self.visualize_path = self.get_parameter('visualize_path').get_parameter_value().bool_value
+        self.visualize_path_topic = self.get_parameter('visualize_path_topic').get_parameter_value().string_value
+        self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
+        self.visualization_publish_period = self.get_parameter('visualization_publish_period').get_parameter_value().double_value
+
+        # --- Initialize variables before loading ---
+        self.raceline = None
+        self.curvatures = None
+        self.path_viz_message = None
+
+        # --- Load Processed Raceline Data FROM CSV ---
+        try:
+            self.get_logger().info(f"Attempting to load raceline from CSV: {track_file}")
+            if not os.path.exists(track_file):
+                 raise FileNotFoundError(f"Track CSV file does not exist at {track_file}")
+            # Use numpy.loadtxt to load the CSV data
+            # Assumes CSV format: s,x,y,heading with a header row
+            loaded_data = np.loadtxt(track_file, delimiter=',', skiprows=1)
+            self.get_logger().info(f"CSV data loaded successfully. Shape: {loaded_data.shape}")
+
+            # Extract the necessary columns
+            if loaded_data.ndim != 2 or loaded_data.shape[1] < 3: # Check for at least x, y columns (index 1, 2)
+                 raise ValueError(f"Loaded CSV data has unexpected shape or columns: {loaded_data.shape}. Expected at least (N, 3).")
+            self.raceline = loaded_data[:, 1:3] # Extract columns 1 (x) and 2 (y)
+            self.get_logger().info(f"Successfully extracted {len(self.raceline)} waypoints (x, y) from CSV.")
+
+            # --- Compute Curvatures ---
+            self.get_logger().info("Computing curvatures from loaded raceline...")
+            self.curvatures = self.compute_curvatures(self.raceline)
+            self.get_logger().info("Curvatures computed.")
+
+        except FileNotFoundError as e:
+            self.get_logger().error(f"{e}")
+            sys.exit(1) # Exit if file not found
+        except ValueError as e:
+            self.get_logger().error(f"Error processing CSV file '{track_file}': {e}")
+            sys.exit(1)
+        except Exception as e: # Catch any other unexpected errors
+             self.get_logger().error(f"An unexpected error occurred during CSV loading: {e}", exc_info=True)
+             sys.exit(1)
+
+        # --- ROS Comms ---
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
+
+        # --- Path Visualization Setup ---
+        self.path_viz_pub = None
+        self.viz_timer = None
+        if self.visualize_path:
+            self.get_logger().info(f"Setting up path visualization on '{self.visualize_path_topic}'")
+            qos_profile = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.path_viz_pub = self.create_publisher(Path, self.visualize_path_topic, qos_profile)
+            self._generate_path_viz_message() # Generate the message
+            if self.path_viz_message:
+                 self.get_logger().info("Publishing initial visualization path...")
+                 self.path_viz_pub.publish(self.path_viz_message) # Publish once
+                 if self.visualization_publish_period > 0:
+                     self.viz_timer = self.create_timer( # Publish periodically
+                         self.visualization_publish_period,
+                         self._timer_publish_path_callback
+                     )
+                     self.get_logger().info(f"Path visualization timer started (publishes every {self.visualization_publish_period}s).")
+            else:
+                 self.get_logger().error("Failed to generate path message for visualization.")
+
+        self.get_logger().info('Pure Pursuit Node initialized (Lap Reset Removed).')
+        self.get_logger().info(f'Using wheelbase: {self.wheelbase}m')
+
+    # --- Method to generate the Path message once ---
+    def _generate_path_viz_message(self):
+        """Generates the nav_msgs/Path message from self.raceline and stores it."""
+        if self.raceline is None or len(self.raceline) == 0:
+            self.get_logger().warn("Cannot generate visualization path: No raceline data loaded.")
+            self.path_viz_message = None; return
+        path_msg = Path(); path_msg.header.stamp = self.get_clock().now().to_msg(); path_msg.header.frame_id = self.map_frame
+        for wp in self.raceline:
+            pose = PoseStamped(); pose.header = path_msg.header
+            try: pose.pose.position.x = float(wp[0]); pose.pose.position.y = float(wp[1])
+            except (IndexError, TypeError): self.get_logger().error(f"Invalid waypoint: {wp}. Skip.", once=True); continue
+            pose.pose.position.z = 0.0; pose.pose.orientation.w = 1.0
+            path_msg.poses.append(pose)
+        self.path_viz_message = path_msg
+        self.get_logger().info(f"Generated path message with {len(self.path_viz_message.poses)} poses for visualization.")
+
+    # --- Timer callback to simply publish the stored message ---
+    def _timer_publish_path_callback(self):
+        """Publishes the pre-generated Path message."""
+        if self.path_viz_pub is not None and self.path_viz_message is not None:
+            self.path_viz_message.header.stamp = self.get_clock().now().to_msg()
+            self.path_viz_pub.publish(self.path_viz_message)
+
+    # --- compute_curvatures (no changes needed) ---
+    def compute_curvatures(self, path):
+        # ... (implementation remains the same) ...
+        N = len(path); curvatures = np.zeros(N)
+        if N < 3: return curvatures
+        for i in range(1, N - 1):
+            p1, p2, p3 = path[i - 1], path[i], path[i + 1]
+            v12=p2-p1; v23=p3-p2; v31=p1-p3
+            a=np.linalg.norm(v23); b=np.linalg.norm(v31); c=np.linalg.norm(v12)
+            area=np.abs(np.cross(v12, -v31)); den=a*b*c
+            k = 0.0 if den < 1e-9 or area < 1e-9 else (2.0 * area) / den
+            curvatures[i] = k
+        return curvatures
+
+    # --- pose_callback function ---
+    def pose_callback(self, msg: PoseWithCovarianceStamped):
+        # Extract position and orientation
+        position=msg.pose.pose.position; orientation=msg.pose.pose.orientation
+        x=position.x; y=position.y; theta=self.get_yaw_from_quaternion(orientation)
+
+        # --- Lap Detection Logic REMOVED ---
+
+        # --- Pure Pursuit Logic ---
+        lookahead_point, curvature=self.find_lookahead_point(np.array([x, y]))
+        if lookahead_point is None:
+            # Stop car if no target found
+            drive_msg=AckermannDriveStamped()
+            drive_msg.header.stamp=self.get_clock().now().to_msg() # Use current time for stop command
+            drive_msg.drive.steering_angle=0.0
+            drive_msg.drive.speed=0.0
+            self.drive_pub.publish(drive_msg)
+            return # Exit callback
+
+        # Transform lookahead point and calculate steering/speed
+        dx=lookahead_point[0]-x; dy=lookahead_point[1]-y
+        lx=math.cos(-theta)*dx-math.sin(-theta)*dy; ly=math.sin(-theta)*dx+math.cos(-theta)*dy
+        dist_sq=lx**2+ly**2
+        if dist_sq<1e-3: sa=0.0 # Check if target is too close
+        else:
+            # Calculate steering based on curvature to lookahead point
+            steering_curvature = (2.0*ly) / dist_sq
+            sa=math.atan(self.wheelbase*steering_curvature)
+
+        # Clamp steering angle
+        max_steer=0.4 # Max realistic steering angle in radians
+        sa=np.clip(sa, -max_steer, max_steer)
+
+        # Calculate speed based on path curvature AT the lookahead point
+        # Adjust the curvature influence factor (e.g., 0.5) to fine-tune speed reduction
+        speed=max(MIN_SPEED, MAX_SPEED*(1.0-min(abs(curvature)*0.5, 1.0)))
+
+        # Publish drive command
+        drive_msg=AckermannDriveStamped()
+        drive_msg.header.stamp=msg.header.stamp # Use pose timestamp for better sync
+        drive_msg.header.frame_id='base_link' # Command is usually relative to base
+        drive_msg.drive.steering_angle=sa
+        drive_msg.drive.speed=speed
+        self.drive_pub.publish(drive_msg)
+
+    # --- Reset Method REMOVED ---
+    # def reset_localization(self): ...
+
+    # --- Costmap Clearing Method REMOVED ---
+    # def clear_costmaps(self): ...
+
+    # --- find_lookahead_point (no changes needed) ---
+    def find_lookahead_point(self, current_pos):
+        # ... (implementation remains the same) ...
+        if self.raceline is None or len(self.raceline)==0: return None, 0.0
+        deltas=self.raceline-current_pos; dist_sq=np.einsum('ij,ij->i',deltas,deltas); closest_idx=np.argmin(dist_sq)
+        li=-1; n=len(self.raceline)
+        for i in range(n):
+            ci=(closest_idx+i)%n; p=self.raceline[ci]
+            dist=np.hypot(p[0]-current_pos[0],p[1]-current_pos[1])
+            if dist>=LOOKAHEAD_DISTANCE: li=ci; break
+        if li!=-1:
+            fp=self.raceline[li]; fc=self.curvatures[li] if li<len(self.curvatures) else 0.0
+            return fp, fc
+        else:
+            # Log warning only once to prevent spam if continuously failing
+            self.get_logger().warn(f"No lookahead point found >= {LOOKAHEAD_DISTANCE}m.", once=True)
+            return None, 0.0
+
+    # --- get_yaw_from_quaternion (no changes needed) ---
+    def get_yaw_from_quaternion(self, q):
+        # ... (implementation remains the same) ...
+        sycp=2.0*(q.w*q.z+q.x*q.y); cycp=1.0-2.0*(q.y*q.y+q.z*q.z)
+        return math.atan2(sycp, cycp)
+
+# --- main function (no changes needed) ---
+def main(args=None):
+    rclpy.init(args=args); node=None
+    try: node=PurePursuitNode(); rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    except SystemExit: pass
+    finally:
+        # Ensure drive command is zero on exit
+        if node and hasattr(node, 'drive_pub'):
+            stop_msg = AckermannDriveStamped()
+            stop_msg.header.stamp = node.get_clock().now().to_msg()
+            stop_msg.drive.speed = 0.0
+            stop_msg.drive.steering_angle = 0.0
+            node.drive_pub.publish(stop_msg)
+            node.get_logger().info("Sent zero drive command on shutdown.")
+        # Destroy node and shutdown ROS
+        if node: node.destroy_node()
+        if rclpy.ok(): rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

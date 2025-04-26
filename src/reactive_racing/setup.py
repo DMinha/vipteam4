@@ -28,6 +28,8 @@ setup(
             'planning = reactive_racing.estimate_centerline:main',
             'control = reactive_racing.compute_control:main',
             'zed2_custom_node = reactive_racing.zed2_custom_node:main',
+            'joystick_ackermann_teleop = reactive_racing.joystick_ackermann_teleop:main',
+          #'control = reactive_racing.racecar_controller:main',
         ],
     },
 )

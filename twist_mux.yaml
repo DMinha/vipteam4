@@ -1,0 +1,9 @@
+topics:
+  - name: cmd_vel
+    topic: /cmd_vel
+    timeout: 0.5
+    priority: 100
+  - name: ackermann_cmd
+    topic: /ackermann_cmd
+    timeout: 0.5
+    priority: 100
