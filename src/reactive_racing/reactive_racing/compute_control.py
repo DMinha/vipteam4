@@ -1,540 +1,482 @@
+#!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPolicy
+from ackermann_msgs.msg import AckermannDriveStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import LaserScan
-import copy
-from ackermann_msgs.msg import AckermannDriveStamped, AckermannDrive
-import math
-from std_msgs.msg import Bool
+from visualization_msgs.msg import Marker
 import numpy as np
-import time
+import math
+import os
+import sys
+from collections import deque
 
-PI = math.pi
-MIN_ANGLE = math.pi/2
-MAX_ANGLE = -math.pi/2
-DISPARITY_THRESHOLD = 0.2
-C_W = 0.3
-C_L = 0.5
+# ==============================================================================
+# PART 1: CONSTANTS (Merged)
+# ==============================================================================
 
-class DisparityExtender:
-    CAR_WIDTH = 0.268
-    # the min difference between adjacent LiDAR points for us to call them disparate
-    DIFFERENCE_THRESHOLD = 0.05
-    
-    # TIME TRIAL
-    MAX_SPEED = 3.7
+# --- FROM SOURCE A (Working Pure Pursuit) ---
+LOOKAHEAD_DISTANCE = 1.2
+MAX_SPEED = 0.65
+MIN_SPEED = 0.55
 
-    # STOP SIGN
-    # MAX_SPEED = 0.5
-    
-    LINEAR_DISTANCE_THRESHOLD = 5.0
-    ANGLE_CHANGE_THRESHOLD = 0.0
-    ANGLE_CHANGE_SPEED = 0.5
-    MAX_ANGLE = 0.8
-    SLOW_SPEED = 1.0
-    MAX_DISTANCE_C = 0.95
-    WHEELBASE_WIDTH=0.328#0.328
-    coefficient_of_friction=0.62
-    gravity=9.81998
-    REVERSAL_THRESHHOLD = 0.85
-    SLOWDOWN_SLOPE = 0.93
+# --- FROM SOURCE B (Overtaking Logic) ---
+# Detection
+OPPONENT_DETECTION_RANGE = 8.0
+OPPONENT_DETECTION_CONE = 50
+MIN_OPPONENT_VELOCITY = 0.01          
+OPPONENT_RACELINE_TOLERANCE = 0.05
+DETECTION_PERSISTENCE_FRAMES = 3
+STRICTLY_AHEAD_THRESHOLD = 0.0
+OPPONENT_POSITION_HISTORY_SIZE = 4
 
-    prev_angle = 0.0
-    prev_index = None
-    is_reversing = False
+# Overtaking
+MIN_SPEED_ADVANTAGE = 0.0
+OVERTAKE_TRIGGER_DISTANCE = 9.0
+OVERTAKE_MIN_DISTANCE = 1.6
+OVERTAKE_LATERAL_OFFSET = 0.525
+OVERTAKE_CLEARANCE_DISTANCE = 1.2
+OVERTAKE_SPEED_FACTOR = 1.0 # Speed boost when passing
 
-    PREV_STOP = False
-    STOP_CONTROLLER = False
-    STOP_TIME = -1
+# Side Selection
+SIDE_SCAN_ANGLE_MIN = 60
+SIDE_SCAN_ANGLE_MAX = 120
+SIDE_SCAN_DISTANCE = 1.0
+MIN_SAFE_SPACE = 0.1
+SPACE_ADVANTAGE_THRESHOLD = 0.3
 
-    def __init__(self, logger):
-        self.logger = logger
-    
-
-    def preprocess_lidar(self, ranges):
-        """ Any preprocessing of the LiDAR data can be done in this function.
-            Possible Improvements: smoothing of outliers in the data and placing
-            a cap on the maximum distance a point can be.
-        """
-        # remove quadrant of LiDAR directly behind us
-        eighth = int(len(ranges) / 6)
-        return np.array(ranges[eighth:-eighth])
-
-    def get_differences(self, ranges):
-        """ Gets the absolute difference between adjacent elements in
-            in the LiDAR data and returns them in an array.
-            Possible Improvements: replace for loop with numpy array arithmetic
-        """
-        differences = [0.]  # set first element to 0
-        for i in range(1, len(ranges)):
-            differences.append(abs(ranges[i] - ranges[i - 1]))
-        return differences
-
-    def get_disparities(self, differences, threshold):
-        """ Gets the indexes of the LiDAR points that were greatly
-            different to their adjacent point.
-            Possible Improvements: replace for loop with numpy array arithmetic
-        """
-        disparities = []
-        for index, difference in enumerate(differences):
-            if difference > threshold:
-                disparities.append(index)
-        return disparities
-
-    def get_num_points_to_cover(self, dist, width):
-        """ Returns the number of LiDAR points that correspond to a width at
-            a given distance.
-            We calculate the angle that would span the width at this distance,
-            then convert this angle to the number of LiDAR points that
-            span this angle.
-            Current math for angle:
-                sin(angle/2) = (w/2)/d) = w/2d
-                angle/2 = sininv(w/2d)
-                angle = 2sininv(w/2d)
-                where w is the width to cover, and d is the distance to the close
-                point.
-            Possible Improvements: use a different method to calculate the angle
-        """
-        # angle = 2 * np.arcsin(width / (2 * dist))
-        # num_points = int(np.ceil(angle / self.radians_per_point))
-        # return num_points
-        # angle = 2 * np.arcsin(width / (2 * dist))
-        # num_points = int(np.ceil(angle / self.radians_per_point))
-        # return num_points
-        angle_step=(0.25)*(math.pi/180)
-        arc_length=angle_step*dist
-        return int(math.ceil(self.CAR_WIDTH / arc_length))
-
-    def cover_points(self, num_points, start_idx, cover_right, ranges):
-        """ 'covers' a number of LiDAR points with the distance of a closer
-            LiDAR point, to avoid us crashing with the corner of the car.
-            num_points: the number of points to cover
-            start_idx: the LiDAR point we are using as our distance
-            cover_right: True/False, decides whether we cover the points to
-                         right or to the left of start_idx
-            ranges: the LiDAR points
-
-            Possible improvements: reduce this function to fewer lines
-        """
-        new_dist = ranges[start_idx]
-        if cover_right:
-            for i in range(num_points):
-                next_idx = start_idx + 1 + i
-                if next_idx >= len(ranges): break
-                if ranges[next_idx] > new_dist:
-                    ranges[next_idx] = new_dist
-        else:
-            for i in range(num_points):
-                next_idx = start_idx - 1 - i
-                if next_idx < 0: break
-                if ranges[next_idx] > new_dist:
-                    ranges[next_idx] = new_dist
-        return ranges
-
-    def extend_disparities(self, disparities, ranges, car_width):
-        """ For each pair of points we have decided have a large difference
-            between them, we choose which side to cover (the opposite to
-            the closer point), call the cover function, and return the
-            resultant covered array.
-            Possible Improvements: reduce to fewer lines
-        """
-        width_to_cover = (car_width / 2)
-        for index in disparities:
-            first_idx = index - 1
-            points = ranges[first_idx:first_idx + 2]
-            close_idx = first_idx + np.argmin(points)
-            far_idx = first_idx + np.argmax(points)
-            close_dist = ranges[close_idx]
-            num_points_to_cover = self.get_num_points_to_cover(close_dist,
-                                                               width_to_cover)
-            cover_right = close_idx < far_idx
-            ranges = self.cover_points(num_points_to_cover, close_idx,
-                                       cover_right, ranges)
-        return ranges
-
-    def get_steering_angle(self, range_index, angle_increment, range_len):
-        """ Calculate the angle that corresponds to a given LiDAR point and
-            process it into a steering angle.
-            Possible improvements: smoothing of aggressive steering angles
-        """
-        angle = -1.57 + (range_index * angle_increment)
-
-        if angle < -1.57:
-            angle = -1.57
-        elif angle > 1.57:
-            angle = 1.57
-        return angle
-
-        # degrees = range_index / 3
-        # angle = math.radians(degrees)
-        
-
-        # if angle < -1.57:
-        #     return -1.57
-        # elif angle > 1.57:
-        #     return 1.57
-        # return angle
-
-        # lidar_angle = (range_index - (range_len / 2)) * self.radians_per_point
-        # steering_angle = np.clip(lidar_angle, np.radians(-90), np.radians(90))
-        # return steering_angle
-    
-    def calculate_min_turning_radius(self,angle,forward_distance):
-        # angle=abs(angle)
-        # if(angle<0.0872665):#if the angle is less than 5 degrees just go as fast possible
-        #     return self.MAX_SPEED
-        # else:
-        #     turning_radius=(self.WHEELBASE_WIDTH/math.sin(angle))
-        #     maximum_velocity=math.sqrt(self.coefficient_of_friction*self.gravity*turning_radius)
-        #     if(maximum_velocity<self.MAX_SPEED):
-        #         maximum_velocity=maximum_velocity*(maximum_velocity/self.MAX_SPEE;D)
-        #     else:
-        #         maximum_velocity=self.MAX_SPEED
-        # return maximum_velocity
-        angle = abs(angle)
-        if angle < 0.0872665:  # 5 degrees in radians
-            return self.MAX_SPEED
-        else:
-            turning_radius = (self.WHEELBASE_WIDTH / math.sin(angle))
-            maximum_velocity = math.sqrt(self.coefficient_of_friction * self.gravity * turning_radius)
-
-            # Calculate stopping distance
-            # Assuming deceleration = 0.5 * gravity (modify as per actual deceleration capabilities)
-            stopping_distance = (maximum_velocity ** 2) / (2 * 0.5 * self.gravity)
-            if stopping_distance > forward_distance:
-                # If stopping distance exceeds forward distance, reduce maximum velocity
-                # Calculate new safe velocity to stop within the forward distance
-                maximum_velocity = math.sqrt(2 * 0.5 * self.gravity * forward_distance)
-
-            if maximum_velocity < self.MAX_SPEED:
-                maximum_velocity = maximum_velocity * (maximum_velocity / self.MAX_SPEED)
-            else:
-                maximum_velocity = self.MAX_SPEED
-        
-        return maximum_velocity
-
-    def _process_lidar(self, lidar_data):
-        """ Run the disparity extender algorithm!
-            Possible improvements: varying the speed based on the
-            steering angle or the distance to the farthest point.
-        """
-        ranges = lidar_data.ranges
-        self.radians_per_point = (2 * np.pi) / len(ranges)
-        proc_ranges = self.preprocess_lidar(ranges)
-        differences = self.get_differences(proc_ranges)
-        disparities = self.get_disparities(differences, self.DIFFERENCE_THRESHOLD)
-        proc_ranges = self.extend_disparities(disparities, proc_ranges,
-                                              self.CAR_WIDTH)
-        # max_value=max(proc_ranges)
-
-        # if self.prev_index != None and proc_ranges[self.prev_index] > 2 and abs(curr_steering_angle - self.prev_angle) < 0.1:
-        #     steering_angle = self.prev_angle
-        #     max_value = proc_ranges[self.prev_index]
-        #     max_index = self.prev_index
-        # else:
-        max_value = max(proc_ranges)
-        max_index = np.argmax(proc_ranges)
-
-        # np_ranges = np.array(proc_ranges)
-        # greater_indices = np.where(np_ranges >= max_value)[0]
-
-        # if(len(greater_indices)==1):
-        #     max_index = greater_indices[0]
-        # else:
-        #     mid=int(len(greater_indices)/2)
-        #     max_index = greater_indices[mid]
-
-        np_ranges = np.array(proc_ranges)
-        # greater_indices = np_ranges >= self.MAX_DISTANCE_C_THRESHOLD
-        # greater_indices = np.where(np_ranges >= min(self.MAX_DISTANCE_C_THRESHOLD, max_value*self.MAX_DISTANCE_C))[0]
-        
-        greater_indices = np.where(np_ranges >= max_value*self.MAX_DISTANCE_C)[0]
-        differences = np.abs(greater_indices - 360)
-        max_index = greater_indices[np.argmin(differences)]
-        center_index = len(proc_ranges) // 2
-        greater_indices = np.where(np_ranges >= max_value * self.MAX_DISTANCE_C)[0]
-        #differences = np.abs(greater_indices - center_index)
-        #if len(differences) > 0:
-        #    max_index = greater_indices[np.argmin(differences)]
-        #else:
-        #    max_index = center_index
-
-        max_value = proc_ranges[max_index]
-        
-        # self.logger.info(f"greater indices: {greater_indices}, max index: {max_index}, max_value: {max_value}")
-
-        steering_angle = self.get_steering_angle(max_index, lidar_data.angle_increment, len(proc_ranges))
-        #steering_angle = self.get_steering_angle(max_index, lidar_data.angle_increment, lidar_data.angle_min)
-
-        d_theta = abs(steering_angle)
-
-        self.prev_angle = steering_angle
-        self.prev_index = max_index
-
-        # self.logger.info(f"Checking max_value: {max_value}, Max_index: {max_index}, Angle: {steering_angle}, Disparity: {disparities}, Ranges: {len(proc_ranges)}")
-        
-        if (self.is_reversing and max_value < 1.7) or (not self.is_reversing and max_value < 1.3):
-            speed = -0.75
-            steering_angle = -steering_angle
-            self.is_reversing = True
-        # elif max_value < self.LINEAR_DISTANCE_THRESHOLD:
-        #     speed = max(0.5, self.MAX_SPEED - 0.9 * self.MAX_SPEED * ((self.LINEAR_DISTANCE_THRESHOLD - max_value) / self.LINEAR_DISTANCE_THRESHOLD))
-        # elif d_theta > self.ANGLE_CHANGE_THRESHOLD:
-        #     speed = calculate_min_turning_radius(steering_angle, max_value)
-        else:
-            self.is_reversing = False
-            speed_d = max(
-                0.5, 
-                self.MAX_SPEED -  self.MAX_SPEED * (self.SLOWDOWN_SLOPE * (self.LINEAR_DISTANCE_THRESHOLD - max_value) / self.LINEAR_DISTANCE_THRESHOLD)
-            )
-            speed_a = self.calculate_min_turning_radius(steering_angle, max_value)
-            speed = min(speed_d, speed_a)
-            min_speed = 0.5
-
-            if max_value < 0.5:
-                min_speed = 0.45
-            elif max_value < 1.3:
-                min_speed = 0.9
-            elif max_value < 1.7:
-                min_speed = 1.0
-            elif max_value < 2.0:
-                min_speed = 1.4
-            elif max_value < 2.5:
-                min_speed = 1.3
-            elif max_value < 3:
-                min_speed = 1.7
-            else:
-                min_speed = 2.2
-            
-            min_speed = 1.05 * min_speed
-            # min_speed = min(1.5, (max_value / 3))
-            speed = max(0.5, min_speed, speed)
-            # speed = max(
-            #     0.6,
-            #     speed
-            # )
-
-        if speed > self.MAX_SPEED:
-            speed = self.MAX_SPEED
-        
-        # speed = max(0.5, self.MAX_SPEED - 1.2 * self.MAX_SPEED * (d_theta / self.MAX_ANGLE))
-        if not self.is_reversing:
-            if d_theta > ((1/10) * self.MAX_ANGLE):
-                speed = max(
-                    0.5,
-                    (1.45 * speed) - (speed * ((d_theta - (18 * np.pi / 180)) / self.MAX_ANGLE))
-                )   
-
-            # UNTESTED
-            if d_theta > (20 * np.pi / 180):
-                speed *= 1.1 + ((d_theta * 180 / np.pi) / 90)
-
-            # if abs(steering_angle) < (10 * np.pi / 180):
-            #     # % faster if less than X dg change in steer
-            #     speed *= 1.05
-
-            # UNTESTED SUBSTITUTE
-            # if steering_angle > ((1/10) * self.MAX_ANGLE):
-            #     cand_speed = (1.2 * speed) - (speed * (steering_angle / (2*self.MAX_ANGLE))) 
-
-            #     if cand_speed > self.MAX_SPEED:
-            #         cand_speed = 0.7 * self.MAX_SPEED
-
-            #     speed = max(
-            #         0.5,
-            #         cand_speed
-            #     )   
+# Motion Filters
+MIN_VELOCITY_SAMPLES = 4
+MIN_CONSISTENT_VELOCITY_RATIO = 0.4
+MAX_LATERAL_MOTION_RATIO = 0.9
+MAX_POSITION_JITTER = 1.0
 
 
-        
-        self.logger.info(f"speed: {speed}, max_value: {max_value}, angle change (rads): {d_theta}, steering angle: {steering_angle}")
-
-        # if abs(steering_angle) > 20.0 / 180.0 * 3.14:
-        #     speed = 1.5
-        # elif abs(steering_angle) > 10.0 / 180.0 * 3.14:
-        #     speed = 2.0
-        # else:
-        #     speed = 2.3
-
-        # if max_value < 1.5:
-        #     speed = 0.0
-
-        return speed, steering_angle, max_value, max_index, differences, disparities, proc_ranges
-
-    def process_observation(self, lidar_data, ego_odom):
-        return self._process_lidar(lidar_data)
-
-
-class ackermann_publisher(Node):
-
-    LAST_LIDAR = None
-    READY_GO = False
-    COMPLETED_STOP = False
-    
-    FAST_MODE = True
-
-    STOP_COUNT = 0
-
+class HybridControlNode(Node):
     def __init__(self):
-        super().__init__('team_1_publisher')
-        self.disparity = DisparityExtender(self.get_logger())
-        self.laser_subscription = self.create_subscription(
-            LaserScan,  # message type
-            'scan',
-            self.lidar_callback,
-            10
+        super().__init__('hybrid_control_node')
+
+        # --- PARAMETERS (From Source A) ---
+        self.declare_parameter('track_file_path', '/home/nvidia/Desktop/team3-vip-f24/build/reactive_racing/reactive_racing/optimized_raceline.csv')
+        self.declare_parameter('wheelbase', 0.33)
+        self.declare_parameter('visualize_path', True)
+        self.declare_parameter('visualize_path_topic', '/loaded_raceline_path')
+        self.declare_parameter('map_frame', 'map')
+        self.declare_parameter('visualization_publish_period', 5.0)
+        
+        # --- PARAMETERS (From Source B) ---
+        self.declare_parameter('enable_overtaking', True)
+        self.declare_parameter('overtaking_debug_mode', True)
+
+        # Get Values
+        track_file = self.get_parameter('track_file_path').get_parameter_value().string_value
+        self.wheelbase = self.get_parameter('wheelbase').get_parameter_value().double_value
+        self.visualize_path = self.get_parameter('visualize_path').get_parameter_value().bool_value
+        self.visualize_path_topic = self.get_parameter('visualize_path_topic').get_parameter_value().string_value
+        self.map_frame = self.get_parameter('map_frame').get_parameter_value().string_value
+        self.visualization_publish_period = self.get_parameter('visualization_publish_period').get_parameter_value().double_value
+        self.enable_overtaking = self.get_parameter('enable_overtaking').get_parameter_value().bool_value
+        self.overtaking_debug_mode = self.get_parameter('overtaking_debug_mode').get_parameter_value().bool_value
+
+        # --- INITIALIZATION ---
+        self.raceline = None
+        self.curvatures = None
+        self.path_viz_message = None
+        
+        # This is needed for Source B logic to know how fast we are going
+        self.current_speed = 0.0 
+        self.current_pose = None
+
+        # Overtaking State (From Source B)
+        self.overtaking = False
+        self.overtake_state = "NORMAL"
+        self.opponent_detected = False
+        self.opponent_position = None
+        self.opponent_position_history = []
+        self.opponent_velocity = 0.0
+        self.opponent_distance = float('inf')
+        self.overtake_side = 0.0
+        self.frames_since_clear = 0
+        self.frames_in_overtaking = 0
+        self.frames_no_detection = 0
+        self.consecutive_detections = 0
+        self.latest_scan = None
+        self.scan_count = 0
+
+        # Load Raceline (From Source A)
+        try:
+            self.get_logger().info(f"Loading raceline from: {track_file}")
+            if not os.path.exists(track_file):
+                raise FileNotFoundError(f"Track file not found: {track_file}")
+            loaded_data = np.loadtxt(track_file, delimiter=',', skiprows=1)
+            self.raceline = loaded_data[:, 1:3]
+            self.curvatures = self.compute_curvatures(self.raceline)
+            self.get_logger().info(f"Loaded {len(self.raceline)} waypoints")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load raceline: {e}"); sys.exit(1)
+
+        # --- ROS COMMUNICATIONS (REAL WORLD COMPATIBLE) ---
+        
+        # QoS Profile for Hardware (Best Effort is required for VESC/LiDAR)
+        best_effort_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
         )
 
-        self.stopsub = self.create_subscription(
-            Bool,
-            '/stopflag',  # Replace with your actual image topic
-            self.stop_callback,
-            10
-        )
+        self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
+        self.target_viz_pub = self.create_publisher(Marker, '/pursuit_target_marker', 10)
+        self.opponent_viz_pub = self.create_publisher(Marker, '/opponent_marker', 10)
 
+        # 1. Main Control Trigger (Reliable) -> From Source A
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, '/amcl_pose', self.pose_callback, 10)
 
-        self.stopready = self.create_subscription(
-            Bool,
-            '/stop_ack',  # Replace with your actual image topic
-            self.stop_callback,
-            10
-        )
+        # 2. LiDAR Input (Best Effort) -> From Source B
+        self.scan_sub = self.create_subscription(
+            LaserScan, '/scan', self.scan_callback, best_effort_qos)
 
-        self.publisher = self.create_publisher(AckermannDriveStamped, '/ackermann_cmd', 10)
-        # time.sleep(10)
+        # 3. Speed Input (Best Effort) -> Just to update self.current_speed
+        self.odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, best_effort_qos)
 
-    def stop_callback(self, msg: Bool):
-        ready = msg.data
-        if ready:
-            self.READY_GO = ready
-        else:
+        # Visualization
+        if self.visualize_path:
+            qos_profile = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            self.path_viz_pub = self.create_publisher(Path, self.visualize_path_topic, qos_profile)
+            self._generate_path_viz_message()
+            if self.path_viz_message:
+                self.path_viz_pub.publish(self.path_viz_message)
+                self.viz_timer = self.create_timer(
+                    self.visualization_publish_period, self._timer_publish_path_callback)
+
+        self.get_logger().info('✅ HYBRID CONTROLLER INITIALIZED')
+        self.get_logger().info('   - Core Logic: Source A (Simple Pure Pursuit)')
+        self.get_logger().info('   - Overtaking: Source B (Smart Side Selection)')
+        self.get_logger().info('   - Hardware: Best Effort QoS Enabled')
+
+    # ==========================================================================
+    # PART 2: CORE CONTROL LOOP (Based on Source A, Enhanced with B)
+    # ==========================================================================
+
+    def pose_callback(self, msg: PoseWithCovarianceStamped):
+        """
+        Triggered by AMCL (Reliable). This is the 'Heartbeat' of the controller.
+        """
+        # 1. Update State
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        x, y = position.x, position.y
+        theta = self.get_yaw_from_quaternion(orientation)
+        self.current_pose = (x, y, theta)
+
+        # 2. Update Overtaking Logic (Source B Logic)
+        lateral_offset = 0.0
+        if self.enable_overtaking and self.latest_scan is not None:
+            self.update_overtaking_state(np.array([x, y]))
+            
+            # If state machine says overtake, we set the offset
+            if self.overtaking and self.overtake_state != "MERGING_BACK":
+                lateral_offset = self.overtake_side
+            # If merging, offset is 0 (return to path)
+            
+            # Visualize opponent
+            if self.opponent_detected and self.opponent_position is not None:
+                self._publish_opponent_marker(self.opponent_position[0], self.opponent_position[1], True)
+            else:
+                self._publish_opponent_marker(0, 0, False)
+
+        # 3. Find Lookahead Point (Source A Logic)
+        lookahead_point, curvature = self.find_lookahead_point(np.array([x, y]))
+        
+        if lookahead_point is None:
+            # Stop car if no target found
+            self.stop_car()
             return
 
-    def lidar_callback(self, msg: LaserScan):
-        # speed, angle = self.reactive_controller.calc_speed_and_angle(msg)
-        # self.disparity.logger.info(f"{self.READY_GO}")
-        if not self.FAST_MODE:
-            self.LAST_LIDAR = msg
-            if (not self.disparity.STOP_CONTROLLER):
-                speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(msg)
-                stamped_msg = AckermannDriveStamped()
-                stamped_msg.drive = AckermannDrive()
-                stamped_msg.drive.steering_angle = angle
-                stamped_msg.drive.speed = speed
+        # 4. Apply Overtaking Offset (The Integration)
+        target_point = lookahead_point
+        if abs(lateral_offset) > 0.01:
+            target_point = self.apply_lateral_offset(np.array([x, y]), lookahead_point, lateral_offset)
 
-                # if not self.READY_GO:
-                #     stamped_msg.drive.speed = 0.
+        # 5. Transform & Steer (Source A Logic)
+        dx = target_point[0] - x
+        dy = target_point[1] - y
+        lx = math.cos(-theta) * dx - math.sin(-theta) * dy
+        ly = math.sin(-theta) * dx + math.cos(-theta) * dy
+        dist_sq = lx**2 + ly**2
 
-                self.publisher.publish(stamped_msg)
-            else:
-                return
-        
+        if dist_sq < 1e-3:
+            sa = 0.0
         else:
-            speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(msg)
-            stamped_msg = AckermannDriveStamped()
-            stamped_msg.drive = AckermannDrive()
-            stamped_msg.drive.steering_angle = angle
-            stamped_msg.drive.speed = speed
+            steering_curvature = (2.0 * ly) / dist_sq
+            sa = math.atan(self.wheelbase * steering_curvature)
 
-            # if not self.READY_GO:
-            #     stamped_msg.drive.speed = 0.
+        # 6. Clamp steering (Source A Logic)
+        max_steer = 0.4
+        sa = np.clip(sa, -max_steer, max_steer)
 
-            self.publisher.publish(stamped_msg)
+        # 7. Speed Calculation (Source A Logic + Overtake Boost)
+        # Source A: speed=max(MIN, MAX*(1-curve))
+        speed = max(MIN_SPEED, MAX_SPEED * (1.0 - min(abs(curvature) * 0.5, 1.0)))
+        
+        if self.overtaking:
+            speed *= OVERTAKE_SPEED_FACTOR # Boost speed when passing!
 
+        # 8. Publish
+        drive_msg = AckermannDriveStamped()
+        drive_msg.header.stamp = msg.header.stamp
+        drive_msg.header.frame_id = 'base_link'
+        drive_msg.drive.steering_angle = sa
+        drive_msg.drive.speed = speed
+        self.drive_pub.publish(drive_msg)
+        
+        # Viz Target
+        self._publish_target_marker(lx, ly, x, y, theta)
 
-    def stop_callback(self, msg: Bool):
-        self.disparity.logger.info(f"flag: {msg.data}")
+    # ==========================================================================
+    # PART 3: SENSOR CALLBACKS (Data Ingestion)
+    # ==========================================================================
 
-        if not self.FAST_MODE:
-            now = time.time()
-            detected = msg.data
+    def scan_callback(self, msg: LaserScan):
+        """Just stores data for the pose_callback to use."""
+        self.latest_scan = msg
+        self.scan_count += 1
 
-            # if detected:
-            #     self.STOP_COUNT += 1
+    def odom_callback(self, msg: Odometry):
+        """Just updates current speed for decision making."""
+        self.current_speed = msg.twist.twist.linear.x
 
-            # if self.STOP_COUNT >= 4:
-            #     if self.disparity.STOP_TIME == -1:
-            #         # haven't stopped on a callback yet
-            #         self.disparity.logger.info("waiting !!")
-            #         self.disparity.STOP_TIME = time.time()
+    # ==========================================================================
+    # PART 4: OVERTAKING LOGIC (Directly from Source B)
+    # ==========================================================================
 
-            #     else:
-            #         # already stopped
-            #         if now - self.disparity.STOP_TIME >= 2.3:
-            #             self.disparity.logger.info("uno segundo !!")
-            #             self.disparity.STOP_TIME = -1
-            #             self.disparity.PREV_STOP = False
-            #             self.disparity.STOP_CONTROLLER = False
-            #             self.STOP_COUNT = 0
+    def update_overtaking_state(self, current_pos):
+        opponent_pos = self.detect_opponent(current_pos)
+        
+        # 1. Update Detection History
+        if opponent_pos is not None:
+            self.consecutive_detections += 1
+            if self.consecutive_detections >= DETECTION_PERSISTENCE_FRAMES:
+                self.opponent_detected = True
+                self.opponent_position = opponent_pos
+                current_time = self.get_clock().now().nanoseconds / 1e9
+                self.opponent_position_history.append((opponent_pos, current_time))
+                if len(self.opponent_position_history) > OPPONENT_POSITION_HISTORY_SIZE:
+                    self.opponent_position_history.pop(0)
+                self.opponent_velocity = self.estimate_opponent_velocity()
+                self.opponent_distance = np.hypot(opponent_pos[0] - current_pos[0], opponent_pos[1] - current_pos[1])
+        else:
+            self.consecutive_detections = 0
+            self.opponent_detected = False
 
+        # 2. State Machine
+        if self.overtake_state == "NORMAL":
+            if self.opponent_detected:
+                should_overtake, side = self.should_attempt_overtake(current_pos)
+                if should_overtake:
+                    self.overtake_state = "APPROACHING"
+                    self.overtake_side = side
+                    self.frames_in_overtaking = 0; self.frames_no_detection = 0
+                    self.get_logger().info(f"🏁 OVERTAKE START! Side: {'LEFT' if side > 0 else 'RIGHT'}")
+        
+        elif self.overtake_state == "APPROACHING":
+            if self.opponent_distance < OVERTAKE_MIN_DISTANCE:
+                self.overtake_state = "OVERTAKING"
+                self.overtaking = True
+        
+        elif self.overtake_state == "OVERTAKING":
+            self.frames_in_overtaking += 1
+            # Check if lost detection
+            if not self.opponent_detected: self.frames_no_detection += 1
+            else: self.frames_no_detection = 0
+            
+            # Check if opponent is behind us
+            is_behind = False
+            if self.opponent_position is not None:
+                x, y, theta = self.current_pose
+                dx = self.opponent_position[0] - x; dy = self.opponent_position[1] - y
+                local_x = math.cos(-theta) * dx - math.sin(-theta) * dy
+                if local_x < -0.5: is_behind = True
 
-            if detected and not self.disparity.PREV_STOP:
-                # first detection, alternative controller
-                self.disparity.PREV_STOP = True
-                self.disparity.STOP_CONTROLLER = True
+            if is_behind or self.frames_no_detection > 20:
+                self.overtake_state = "CLEARING"
+                self.frames_since_clear = 0
+                self.get_logger().info("💨 CLEARING (Opponent passed)")
+            elif self.frames_in_overtaking > 100:
+                self.overtake_state = "MERGING_BACK" # Timeout
+        
+        elif self.overtake_state == "CLEARING":
+            self.frames_since_clear += 1
+            if self.frames_since_clear > 15:
+                self.overtake_state = "MERGING_BACK"
+                self.get_logger().info("↩️  MERGING BACK")
+        
+        elif self.overtake_state == "MERGING_BACK":
+            self.overtaking = False # Stop applying offset
+            self.overtake_state = "NORMAL" # Reset
 
-            elif not detected:
-                # no longer in viewing range but already detected; let's stop for 1 second
+    def detect_opponent(self, current_pos):
+        if self.latest_scan is None or self.current_pose is None: return None
+        x, y, theta = self.current_pose
+        angle = self.latest_scan.angle_min
+        forward_angle_range = math.radians(OPPONENT_DETECTION_CONE)
+        
+        closest_obstacle = None
+        closest_distance = float('inf')
+        
+        # Scan processing
+        for r in self.latest_scan.ranges:
+            if abs(angle) < forward_angle_range and self.latest_scan.range_min < r < OPPONENT_DETECTION_RANGE:
+                # Transform to map frame (Source B Logic)
+                obs_x = x + r * math.cos(theta + angle)
+                obs_y = y + r * math.sin(theta + angle)
                 
-                if self.disparity.PREV_STOP and self.disparity.STOP_TIME == -1:
-                    # haven't stopped on a callback yet
-                    self.disparity.logger.info("waiting !!")
-                    self.disparity.STOP_TIME = time.time()
-                    # self.disparity.PREV_STOP = False
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.
-                    self.publisher.publish(stamped_msg)
+                # Check strict ahead (Source B Logic)
+                dx = obs_x - x; dy = obs_y - y
+                local_x = math.cos(-theta) * dx - math.sin(-theta) * dy
+                if local_x < STRICTLY_AHEAD_THRESHOLD:
+                    angle += self.latest_scan.angle_increment; continue
+                
+                # Check raceline proximity (Source B Logic)
+                if self.raceline is not None:
+                    deltas = self.raceline - np.array([obs_x, obs_y])
+                    dist_to_raceline = np.min(np.sqrt(np.einsum('ij,ij->i', deltas, deltas)))
+                    if dist_to_raceline < OPPONENT_RACELINE_TOLERANCE and r < closest_distance:
+                        closest_distance = r; closest_obstacle = np.array([obs_x, obs_y])
+            angle += self.latest_scan.angle_increment
+        return closest_obstacle
 
-                elif self.disparity.PREV_STOP:
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.
-                    self.publisher.publish(stamped_msg)
-                    
-                    # already stopped
-                    if now - self.disparity.STOP_TIME >= 1.5:
-                        self.disparity.logger.info(f"{now - self.disparity.STOP_TIME} uno segundo !!")
-                        self.disparity.STOP_TIME = -1
-                        self.disparity.PREV_STOP = False
-                        self.disparity.STOP_CONTROLLER = False
+    def should_attempt_overtake(self, current_pos):
+        # Basic Checks
+        if not self.opponent_detected or self.opponent_position is None: return False, 0.0
+        if self.opponent_distance > OVERTAKE_TRIGGER_DISTANCE: return False, 0.0
+        
+        # Speed Check
+        if (self.current_speed - self.opponent_velocity) < MIN_SPEED_ADVANTAGE: return False, 0.0
+        
+        # Smart Side Selection (Source B)
+        left_space = self.measure_lateral_space('left')
+        right_space = self.measure_lateral_space('right')
+        
+        if left_space < MIN_SAFE_SPACE and right_space < MIN_SAFE_SPACE: return False, 0.0
+        
+        if abs(left_space - right_space) > SPACE_ADVANTAGE_THRESHOLD:
+            return True, OVERTAKE_LATERAL_OFFSET if left_space > right_space else -OVERTAKE_LATERAL_OFFSET
+        else:
+            # Tiebreaker based on opponent Y
+            x, y, theta = self.current_pose
+            dx = self.opponent_position[0] - x; dy = self.opponent_position[1] - y
+            local_y = math.sin(-theta) * dx + math.cos(-theta) * dy
+            return True, OVERTAKE_LATERAL_OFFSET if local_y > 0 else -OVERTAKE_LATERAL_OFFSET
 
-            if self.disparity.STOP_CONTROLLER and self.disparity.STOP_TIME == -1:
-                self.disparity.logger.info("stop controller")
-                if self.LAST_LIDAR:
-                    speed, angle, max_value, max_index, differences, disparities, proc_ranges = self.disparity._process_lidar(self.LAST_LIDAR)
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = angle
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.5
-                else:
-                    stamped_msg = AckermannDriveStamped()
-                    stamped_msg.drive = AckermannDrive()
-                    stamped_msg.drive.steering_angle = 0.
-                    # stamped_msg.drive.speed = speed
-                    stamped_msg.drive.speed = 0.3
+    def measure_lateral_space(self, side):
+        if self.latest_scan is None: return 0.0
+        ranges = np.array(self.latest_scan.ranges)
+        angle_min = self.latest_scan.angle_min
+        angle_inc = self.latest_scan.angle_increment
+        
+        if side == 'left':
+            a_start, a_end = math.radians(SIDE_SCAN_ANGLE_MIN), math.radians(SIDE_SCAN_ANGLE_MAX)
+        else:
+            a_start, a_end = math.radians(-SIDE_SCAN_ANGLE_MAX), math.radians(-SIDE_SCAN_ANGLE_MIN)
+            
+        dists = []
+        for i, r in enumerate(ranges):
+            a = angle_min + i * angle_inc
+            if a_start <= a <= a_end and 0.1 < r < SIDE_SCAN_DISTANCE:
+                dists.append(r)
+        return np.mean(dists) if dists else 10.0 # Default to open if nothing seen
 
-                # if not self.READY_GO:
-                #     stamped_msg.drive.speed = 0.
+    def estimate_opponent_velocity(self):
+        if len(self.opponent_position_history) < 2: return 0.0
+        # Simple velocity calc
+        p1, t1 = self.opponent_position_history[0]
+        p2, t2 = self.opponent_position_history[-1]
+        dist = np.hypot(p2[0]-p1[0], p2[1]-p1[1])
+        dt = t2 - t1
+        return dist/dt if dt > 0 else 0.0
 
-                self.publisher.publish(stamped_msg)
+    # ==========================================================================
+    # PART 5: MATH HELPERS (From Source A)
+    # ==========================================================================
 
+    def apply_lateral_offset(self, car_pos, target_point, offset):
+        dx = target_point[0] - car_pos[0]; dy = target_point[1] - car_pos[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1e-3: return target_point
+        # Perpendicular vector (-dy, dx)
+        return np.array([target_point[0] + offset * (-dy/dist), target_point[1] + offset * (dx/dist)])
 
+    def compute_curvatures(self, path):
+        N = len(path); curvatures = np.zeros(N)
+        if N < 3: return curvatures
+        for i in range(1, N - 1):
+            p1, p2, p3 = path[i-1], path[i], path[i+1]
+            v12=p2-p1; v23=p3-p2; v31=p1-p3
+            area=np.abs(np.cross(v12, -v31))
+            den=np.linalg.norm(v12)*np.linalg.norm(v23)*np.linalg.norm(v31)
+            if den > 1e-9: curvatures[i] = 2.0 * area / den
+        return curvatures
+
+    def find_lookahead_point(self, current_pos):
+        if self.raceline is None: return None, 0.0
+        deltas = self.raceline - current_pos
+        dist_sq = np.einsum('ij,ij->i', deltas, deltas)
+        closest_idx = np.argmin(dist_sq)
+        n = len(self.raceline)
+        for i in range(n):
+            ci = (closest_idx + i) % n
+            p = self.raceline[ci]
+            dist = np.hypot(p[0] - current_pos[0], p[1] - current_pos[1])
+            if dist >= LOOKAHEAD_DISTANCE:
+                return p, self.curvatures[ci] if ci < len(self.curvatures) else 0.0
+        return self.raceline[(closest_idx+n//2)%n], 0.0
+
+    def get_yaw_from_quaternion(self, q):
+        return math.atan2(2.0*(q.w*q.z+q.x*q.y), 1.0-2.0*(q.y*q.y+q.z*q.z))
+
+    def stop_car(self):
+        msg = AckermannDriveStamped()
+        self.drive_pub.publish(msg)
+
+    # --- Visualization Helpers ---
+    def _publish_target_marker(self, lx, ly, car_x, car_y, car_theta):
+        m = Marker(); m.header.frame_id='map'; m.header.stamp=self.get_clock().now().to_msg()
+        m.ns='target'; m.id=0; m.type=Marker.SPHERE; m.action=Marker.ADD
+        m.pose.position.x = car_x + (lx*math.cos(car_theta)-ly*math.sin(car_theta))
+        m.pose.position.y = car_y + (lx*math.sin(car_theta)+ly*math.cos(car_theta))
+        m.scale.x=0.3; m.scale.y=0.3; m.scale.z=0.3; m.color.a=1.0; m.color.g=1.0
+        self.target_viz_pub.publish(m)
+
+    def _publish_opponent_marker(self, x, y, detected):
+        m = Marker(); m.header.frame_id='map'; m.header.stamp=self.get_clock().now().to_msg()
+        m.ns='opp'; m.id=1; m.type=Marker.CUBE
+        if detected:
+            m.action=Marker.ADD; m.pose.position.x=x; m.pose.position.y=y; m.pose.position.z=0.15
+            m.scale.x=0.5; m.scale.y=0.3; m.scale.z=0.3; m.color.a=0.9; m.color.r=1.0
+        else: m.action=Marker.DELETE
+        self.opponent_viz_pub.publish(m)
+
+    def _generate_path_viz_message(self):
+        if self.raceline is None: return
+        msg = Path(); msg.header.frame_id=self.map_frame
+        for p in self.raceline:
+            ps=PoseStamped(); ps.pose.position.x=float(p[0]); ps.pose.position.y=float(p[1]); msg.poses.append(ps)
+        self.path_viz_message = msg
+
+    def _timer_publish_path_callback(self):
+        if self.path_viz_pub and self.path_viz_message: self.path_viz_pub.publish(self.path_viz_message)
 
 def main(args=None):
     rclpy.init(args=args)
-    ackermann_publisher_i = ackermann_publisher()
-    rclpy.spin(ackermann_publisher_i)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    ackermann_publisher_i.destroy_node()
-    rclpy.shutdown()
+    node = HybridControlNode()
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    finally:
+        node.stop_car(); node.destroy_node(); rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
